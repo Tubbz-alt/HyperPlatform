@@ -11,6 +11,7 @@
 #include "log.h"
 #include "util.h"
 #include "performance.h"
+#include "vmm.h"
 
 extern "C" {
 ////////////////////////////////////////////////////////////////////////////////
@@ -639,12 +640,11 @@ _Use_decl_annotations_ void EptHandleEptViolation(EptData *ept_data) {
           ? UtilVmRead(VmcsField::kGuestLinearAddress)
           : 0);
 
-  if (exit_qualification.fields.ept_readable ||
-      exit_qualification.fields.ept_writeable ||
-      exit_qualification.fields.ept_executable) {
-    HYPERPLATFORM_COMMON_DBG_BREAK();
-    HYPERPLATFORM_LOG_ERROR_SAFE("[UNK1] VA = %p, PA = %016llx", fault_va,
-                                 fault_pa);
+  if ((exit_qualification.fields.ept_readable ||
+        exit_qualification.fields.ept_writeable ||
+        exit_qualification.fields.ept_executable) &&
+        exit_qualification.fields.caused_by_translation) {
+    VmmDelayedDebugException_EptViolationHandler(ept_data);
     return;
   }
 

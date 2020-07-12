@@ -89,6 +89,8 @@ using KtrapFrame = KtrapFrameX86;
 //
 // prototypes
 //
+EXTERN_C NTSTATUS VmmDelayedDebugExceptionStart();
+EXTERN_C VOID VmmDelayedDebugException_EptViolationHandler(struct EptData* ept_data);
 
 ////////////////////////////////////////////////////////////////////////////////
 //

@@ -16,6 +16,7 @@
 #include "power_callback.h"
 #include "util.h"
 #include "vm.h"
+#include "vmm.h"
 #include "performance.h"
 
 extern "C" {
@@ -74,7 +75,7 @@ _Use_decl_annotations_ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object,
 
   auto status = STATUS_UNSUCCESSFUL;
   driver_object->DriverUnload = DriverpDriverUnload;
-  HYPERPLATFORM_COMMON_DBG_BREAK();
+  //HYPERPLATFORM_COMMON_DBG_BREAK();
 
   // Request NX Non-Paged Pool when available
   ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
@@ -154,6 +155,17 @@ _Use_decl_annotations_ NTSTATUS DriverEntry(PDRIVER_OBJECT driver_object,
   // Register re-initialization for the log functions if needed
   if (need_reinitialization) {
     LogRegisterReinitialization(driver_object);
+  }
+
+  status = VmmDelayedDebugExceptionStart();
+  if (!NT_SUCCESS(status)) {
+    HotplugCallbackTermination();
+    PowerCallbackTermination();
+    UtilTermination();
+    PerfTermination();
+    GlobalObjectTermination();
+    LogTermination();
+    return status;
   }
 
   HYPERPLATFORM_LOG_INFO("The VMM has been installed.");

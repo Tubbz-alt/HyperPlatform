@@ -410,6 +410,50 @@ errorWithCode:
 AsmInvvpid ENDP
 
 
+;==============================================================================
+; DelayedDebugException
+;==============================================================================
+
+.data
+
+public gAsmDelayedDebugException_ExceptionAddress
+public gAsmDelayedDebugException_DelayedExceptionAddress
+public AsmTestDelayedDebugException
+
+;
+; Isolate this assembly code so that it is not in the same page.
+;
+_ASM_C$1 segment align(4096) 'CODE'
+
+AsmTestDelayedDebugException:
+    ;
+    ; Set the trap flag.
+    ;
+    pushfq
+    or      qword ptr [rsp], 100h
+    popfq
+    nop
+
+    ;
+    ; A single-step exception should always occur here.
+    ;
+gAsmDelayedDebugException_ExceptionAddress:
+    nop
+
+    ;
+    ; If a vmm removes the execute access bit for this page's EPT entry and
+    ; single steps this routine using the monitor trap flag then occasionally
+    ; the single-step exception will occur at this adddress instead of at
+    ; 'gAsmDelayedDebugException_ExceptionAddress'.
+    ;
+gAsmDelayedDebugException_DelayedExceptionAddress:
+    nop
+
+    ret
+
+_ASM_C$1 ends
+
+
 PURGE PUSHAQ
 PURGE POPAQ
 PURGE ASM_DUMP_REGISTERS

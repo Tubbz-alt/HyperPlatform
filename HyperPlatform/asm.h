@@ -142,6 +142,19 @@ unsigned char __stdcall AsmInvvpid(
     _In_ InvVpidType invvpid_type,
     _In_ const InvVpidDescriptor *invvpid_descriptor);
 
+//=============================================================================
+// DelayedDebugException
+//=============================================================================
+
+/// The fixed address of the single-step exception.
+EXTERN_C ULONG_PTR gAsmDelayedDebugException_ExceptionAddress;
+
+/// The fixed address of the single-step exception when the bug occurs.
+EXTERN_C ULONG_PTR gAsmDelayedDebugException_DelayedExceptionAddress;
+
+/// Exercise the delayed #DB.
+void __stdcall AsmTestDelayedDebugException();
+
 ////////////////////////////////////////////////////////////////////////////////
 //
 // variables

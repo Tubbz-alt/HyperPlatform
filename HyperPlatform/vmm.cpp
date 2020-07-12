@@ -177,6 +177,338 @@ static VmExitHistory g_vmmp_vm_exit_history[kVmmpNumberOfProcessors]
 // implementations
 //
 
+
+//=============================================================================
+// DelayedDebugException
+//=============================================================================
+
+//
+// The 'target page' is the page which contains the
+//  'AsmTestDelayedDebugException' assembly routine.
+//
+
+#include "util.h"
+
+HANDLE g_DdeThreadHandle = NULL;
+PVOID g_TargetVirtualPage = NULL;
+ULONG64 g_TargetPhysicalPage = NULL;
+ULONG64 g_ExceptionCounter = 0;
+ULONG64 g_MtfEventCounter = 0;
+ULONG64 g_EptViolationEventCounter = 0;
+
+
+//
+// Disable execute access for the target page.
+//
+VOID VmmpDelayedDebugException_VmCallHandler(EptData* ept_data)
+{
+  EptCommonEntry* ept_entry = NULL;
+
+  g_TargetVirtualPage =
+    PAGE_ALIGN(&gAsmDelayedDebugException_ExceptionAddress);
+  g_TargetPhysicalPage = UtilPaFromVa(g_TargetVirtualPage);
+
+  HYPERPLATFORM_LOG_DEBUG_SAFE("g_TargetVirtualPage:  %p", g_TargetVirtualPage);
+  HYPERPLATFORM_LOG_DEBUG_SAFE("g_TargetPhysicalPage: %p", g_TargetPhysicalPage);
+
+  ept_entry = EptGetEptPtEntry(ept_data, g_TargetPhysicalPage);
+  if (!ept_entry)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("EptGetEptPtEntry failed.");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+  HYPERPLATFORM_LOG_DEBUG_SAFE("Execute access removed from target page.");
+
+  ept_entry->fields.execute_access = FALSE;
+
+exit:
+  return;
+}
+
+
+LONG VmmpDelayedDebugException_ThreadRoutine_SEH(
+    _In_ PEXCEPTION_POINTERS pExceptionPointers)
+{
+  g_ExceptionCounter++;
+
+  //
+  // This should never occur.
+  //
+  if (pExceptionPointers->ExceptionRecord->ExceptionCode !=
+    STATUS_SINGLE_STEP)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE(
+      "Unexpected exception code: 0x%X",
+      pExceptionPointers->ExceptionRecord->ExceptionCode);
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    return EXCEPTION_EXECUTE_HANDLER;
+  }
+
+  //
+  // If this occurs then the single-step #DB was delayed.
+  //
+  if (pExceptionPointers->ExceptionRecord->ExceptionAddress !=
+    &gAsmDelayedDebugException_ExceptionAddress)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE(
+      "Unexpected exception address. (Actual = %p, Expected = %p, #Exceptions = %I64u)",
+      pExceptionPointers->ExceptionRecord->ExceptionAddress,
+      &gAsmDelayedDebugException_ExceptionAddress,
+      g_ExceptionCounter);
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    return EXCEPTION_EXECUTE_HANDLER;
+  }
+
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+
+//
+// Execute a loop until the bug behavior occurs.
+//
+VOID VmmpDelayedDebugException_ThreadRoutine(PVOID pContext)
+{
+  ULONG i = 0;
+
+  UNREFERENCED_PARAMETER(pContext);
+
+  HYPERPLATFORM_LOG_DEBUG_SAFE("Entering %s", __FUNCTION__);
+
+  for (i = 0; i < ULONG_MAX; i++)
+  {
+    __try
+    {
+      //
+      // This assembly routine will generate a single-step exception
+      //  which will be caught by the exception handler:
+      //  'VmmpDelayedDebugException_ThreadRoutine_SEH'.
+      //
+      AsmTestDelayedDebugException();
+    }
+    __except (
+      VmmpDelayedDebugException_ThreadRoutine_SEH(
+        GetExceptionInformation()))
+    {
+      HYPERPLATFORM_LOG_ERROR_SAFE(
+        "VmmpDelayedDebugException_ThreadRoutine_SEH failed.");
+      HYPERPLATFORM_COMMON_DBG_BREAK();
+      break;
+    }
+  }
+
+  HYPERPLATFORM_LOG_DEBUG_SAFE("Exiting %s", __FUNCTION__);
+  HYPERPLATFORM_COMMON_DBG_BREAK();
+}
+
+
+//
+// Remove execute access from the target page after executing one instruction.
+//
+VOID VmmpDelayedDebugException_MonitorTrapFlagHandler(EptData* ept_data)
+{
+  ULONG64 guest_pa = 0;
+  ULONG64 guest_pp = 0;
+  EptCommonEntry* ept_entry = NULL;
+  VmxProcessorBasedControls proc_based_ctls = {};
+  VmxStatus vmxstatus = {};
+
+  g_MtfEventCounter++;
+
+  guest_pa = UtilPaFromVa(g_TargetVirtualPage);
+  if (!guest_pa)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("null guest_pa.");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+  guest_pp = (ULONG64)PAGE_ALIGN(guest_pa);
+
+  //
+  // Modify the ept entry to remove execute access.
+  //
+  ept_entry = EptGetEptPtEntry(ept_data, g_TargetPhysicalPage);
+  if (!ept_entry)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("EptGetEptPtEntry failed.");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+  ept_entry->fields.execute_access = FALSE;
+
+  //
+  // Disable the monitor trap flag.
+  //
+  proc_based_ctls.all =
+    (unsigned int)UtilVmRead(VmcsField::kCpuBasedVmExecControl);
+
+  proc_based_ctls.fields.monitor_trap_flag = FALSE;
+
+  vmxstatus = UtilVmWrite(
+    VmcsField::kCpuBasedVmExecControl,
+    proc_based_ctls.all);
+  if (VmxStatus::kOk != vmxstatus)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("UtilVmWrite failed. (MTF handler)");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+  vmxstatus = UtilInveptGlobal();
+  if (VmxStatus::kOk != vmxstatus)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("UtilInveptGlobal failed. (MTF handler)");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+exit:
+  return;
+}
+
+
+VOID VmmDelayedDebugException_EptViolationHandler(EptData* ept_data)
+{
+  ULONG64 guest_pa = 0;
+  ULONG64 guest_pp = 0;
+  EptViolationQualification exit_qualification = {};
+  EptCommonEntry* ept_entry = NULL;
+  VmxProcessorBasedControls proc_based_ctls = {};
+  VmxStatus vmxstatus = {};
+
+  exit_qualification.all =
+    (unsigned int)UtilVmRead(VmcsField::kExitQualification);
+
+  guest_pa = UtilVmRead64(VmcsField::kGuestPhysicalAddress);
+
+  guest_pp = (ULONG64)PAGE_ALIGN(guest_pa);
+
+  //
+  // If this ept violation is not for the target page then exit.
+  //
+  if (guest_pp != g_TargetPhysicalPage)
+  {
+    goto exit;
+  }
+
+  g_EptViolationEventCounter++;
+
+  NT_ASSERT(!exit_qualification.fields.read_access);
+  NT_ASSERT(!exit_qualification.fields.write_access);
+  NT_ASSERT(exit_qualification.fields.execute_access);
+
+  //
+  // Modify the ept entry to allow execute access.
+  //
+  ept_entry = EptGetEptPtEntry(ept_data, guest_pp);
+  if (!ept_entry)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("EptGetEptPtEntry failed.");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+  NT_ASSERT(!ept_entry->fields.execute_access);
+
+  ept_entry->fields.execute_access = TRUE;
+
+  //
+  // Enable the MTF control so that we can reset the ept access permission
+  //  after executing one instruction.
+  //
+  // See: VmmpDelayedDebugException_MonitorTrapFlagHandler
+  //
+  proc_based_ctls.all =
+    (unsigned int)UtilVmRead(VmcsField::kCpuBasedVmExecControl);
+
+  proc_based_ctls.fields.monitor_trap_flag = TRUE;
+
+  vmxstatus = UtilVmWrite(
+    VmcsField::kCpuBasedVmExecControl,
+    proc_based_ctls.all);
+  if (VmxStatus::kOk != vmxstatus)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("UtilVmWrite failed. (MTF enable)");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+  vmxstatus = UtilInveptGlobal();
+  if (VmxStatus::kOk != vmxstatus)
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("UtilInveptGlobal failed. (MTF enable)");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+exit:
+  return;
+}
+
+
+//
+// Create the bug behavior exercise thread.
+//
+NTSTATUS VmmDelayedDebugExceptionStart()
+{
+  NTSTATUS ntstatus = STATUS_SUCCESS;
+
+  //
+  // If WinDbg kd is attached then the user should execute 'sxi sse; sxi ssec;'
+  //  so that WinDbg ignores single-step exceptions.
+  //
+  if (!(KD_DEBUGGER_NOT_PRESENT))
+  {
+    HYPERPLATFORM_LOG_DEBUG_SAFE(
+      "Execute the following command in WinDbg: sxi sse; sxi ssec;");
+  }
+
+  UtilSleep(5000);
+  HYPERPLATFORM_COMMON_DBG_BREAK();
+
+  //
+  // Remove execute access from the target page's ept entry.
+  //
+  ntstatus = UtilVmCall(HypercallNumber::kDelayedDebugExceptionVmCall, NULL);
+  if (!NT_SUCCESS(ntstatus))
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("UtilVmCall failed.");
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+  //
+  // Create the exercise thread.
+  //
+  ntstatus = PsCreateSystemThread(
+    &g_DdeThreadHandle,
+    THREAD_ALL_ACCESS,
+    NULL,
+    NULL,
+    NULL,
+    VmmpDelayedDebugException_ThreadRoutine,
+    NULL);
+  if (!NT_SUCCESS(ntstatus))
+  {
+    HYPERPLATFORM_LOG_ERROR_SAFE("PsCreateSystemThread failed: 0x%X",
+      ntstatus);
+    HYPERPLATFORM_COMMON_DBG_BREAK();
+    goto exit;
+  }
+
+exit:
+  return ntstatus;
+}
+
+//=============================================================================
+// DelayedDebugException
+//=============================================================================
+
+
+
 // A high level VMX handler called from AsmVmExitHandler().
 // Return true for vmresume, or return false for vmxoff.
 #pragma warning(push)
@@ -289,7 +621,7 @@ _Use_decl_annotations_ static void VmmpHandleVmExit(
       break;
     case VmxExitReason::kMonitorTrapFlag:
       VmmpHandleMonitorTrap(guest_context);
-      /* UNREACHABLE */
+      break;
     case VmxExitReason::kGdtrOrIdtrAccess:
       VmmpHandleGdtrOrIdtrAccess(guest_context);
       break;
@@ -352,10 +684,12 @@ _Use_decl_annotations_ static void VmmpHandleUnexpectedExit(
 // MTF VM-exit
 _Use_decl_annotations_ static void VmmpHandleMonitorTrap(
     GuestContext *guest_context) {
-  VmmpDumpGuestState();
-  HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnexpectedVmExit,
-                                 reinterpret_cast<ULONG_PTR>(guest_context),
-                                 guest_context->ip, 0);
+  VmmpDelayedDebugException_MonitorTrapFlagHandler(
+    guest_context->stack->processor_data->ept_data);
+  //VmmpDumpGuestState();
+  //HYPERPLATFORM_COMMON_BUG_CHECK(HyperPlatformBugCheck::kUnexpectedVmExit,
+  //                               reinterpret_cast<ULONG_PTR>(guest_context),
+  //                               guest_context->ip, 0);
 }
 
 // Interrupt
@@ -1225,6 +1559,11 @@ _Use_decl_annotations_ static void VmmpHandleVmCall(
     case HypercallNumber::kGetSharedProcessorData:
       *static_cast<void **>(context) =
           guest_context->stack->processor_data->shared_data;
+      VmmpIndicateSuccessfulVmcall(guest_context);
+      break;
+    case HypercallNumber::kDelayedDebugExceptionVmCall:
+      VmmpDelayedDebugException_VmCallHandler(
+        guest_context->stack->processor_data->ept_data);
       VmmpIndicateSuccessfulVmcall(guest_context);
       break;
   }
